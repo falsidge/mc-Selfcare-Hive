@@ -1,10 +1,12 @@
 package tk.estecka.selfcarehive.mixin;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
+
+import net.minecraft.core.HolderLookup;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.Tag;
 import org.joml.Math;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -19,28 +21,24 @@ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.sugar.Local;
 import com.llamalad7.mixinextras.sugar.Share;
 import com.llamalad7.mixinextras.sugar.ref.LocalRef;
-import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.block.BlockState;
-import net.minecraft.block.entity.BeehiveBlockEntity;
-import net.minecraft.block.entity.BlockEntity;
-import net.minecraft.block.entity.BeehiveBlockEntity.BeeData;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.passive.BeeEntity;
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtElement;
-import net.minecraft.registry.RegistryWrapper;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.world.World;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BeehiveBlockEntity;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
 import tk.estecka.selfcarehive.BeehiveUtil;
+import tk.estecka.selfcarehive.Config;
 import tk.estecka.selfcarehive.IBeeColonyTracker;
 import tk.estecka.selfcarehive.SelfCareHive;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.entity.animal.Bee;
 
-import static net.minecraft.block.entity.BeehiveBlockEntity.MAX_BEE_COUNT;
+import static  net.minecraft.world.level.block.entity.BeehiveBlockEntity.MAX_OCCUPANTS;
 
 
 @Unique
-@Mixin(BeehiveBlockEntity.class)
+@Mixin(net.minecraft.world.level.block.entity.BeehiveBlockEntity.class)
 public class BeehiveEntityMixin
 extends BlockEntity
 implements IBeeColonyTracker
@@ -51,7 +49,7 @@ implements IBeeColonyTracker
 	 * The UUID of bees that have left the nest, and the amount of ticks since
 	 * they left. These values are only updated during garbage collection.
 	 */
-	private final Map<UUID,Long> knownBees = new HashMap<>(MAX_BEE_COUNT + 1);
+	private final Map<UUID,Long> knownBees = new HashMap<>(MAX_OCCUPANTS + 1);
 	
 	/**
 	 * Ticks since the previous garbage collection.
@@ -60,16 +58,18 @@ implements IBeeColonyTracker
 
 
 	private BeehiveEntityMixin(){ super(null, null, null); }
-	@Shadow public int	getBeeCount(){ throw new AssertionError(); }
+	@Shadow public int	getOccupantCount(){ throw new AssertionError(); }
 
 
 /******************************************************************************/
 /* # Colony Tracker                                                           */
-/******************************************************************************/
+	@Shadow @Final public static int MAX_OCCUPANTS;
+
+	/******************************************************************************/
 
 	private void GarbageCollectBees() {
 		// Updates absence times, and removes bees that are deemed missing.
-		final int maxAbsence = this.getWorld().getServer().getGameRules().getInt(SelfCareHive.TRACKING_DURATION);
+		final int maxAbsence = Config.tracking_duration;
 		var iterator = knownBees.entrySet().iterator();
 		while (iterator.hasNext()) {
 			var entry = iterator.next();
@@ -79,22 +79,22 @@ implements IBeeColonyTracker
 				entry.setValue(absenceTime);
 			else {
 				iterator.remove();
-				if (FabricLoader.getInstance().isDevelopmentEnvironment())
+				if (Config.debugMode)
 					SelfCareHive.LOGGER.warn("A bee has gone missing: {}", entry.getKey());
 			}
 		}
 		this.elapsedTicks = 0;
 
 		// Removes bees that were pushed out by new inhabitants.
-		final int maxKnownBees = Math.max(0, MAX_BEE_COUNT - this.getBeeCount());
+		final int maxKnownBees = Math.max(0, MAX_OCCUPANTS - this.getOccupantCount());
 		if (knownBees.size() > maxKnownBees) {
 			// Sorts from newest (smallest) to oldest (largest)
 			final var sortedEntries = new ArrayList<>(knownBees.entrySet());
-			sortedEntries.sort( (a, b) -> Long.compare(a.getValue(), b.getValue()) );
+			sortedEntries.sort(Comparator.comparingLong(Map.Entry::getValue));
 
 			// Skips the first few bees (the newest), removes the rest.
 			for (int i=maxKnownBees; i<sortedEntries.size(); ++i){
-				if (FabricLoader.getInstance().isDevelopmentEnvironment())
+				if (Config.debugMode)
 					SelfCareHive.LOGGER.warn("Superfluous bee was pruned: {}", sortedEntries.get(i).getKey());
 				this.knownBees.remove(sortedEntries.get(i).getKey());
 			}
@@ -103,7 +103,7 @@ implements IBeeColonyTracker
 
 	public void selfcarehive$LogColony(){
 		StringBuilder string = new StringBuilder();
-		string.append("Inside: ").append(this.getBeeCount())
+		string.append("Inside: ").append(this.getOccupantCount())
 		      .append(", Outside: ").append(this.knownBees.size())
 		      ;
 
@@ -115,7 +115,7 @@ implements IBeeColonyTracker
 
 	public boolean selfcarehive$isColonyFull(){
 		this.GarbageCollectBees();
-		return (this.getBeeCount() + this.knownBees.size()) >= MAX_BEE_COUNT;
+		return (this.getOccupantCount() + this.knownBees.size()) >= MAX_OCCUPANTS;
 	}
 
 	public void selfcarehive$RememberBee(UUID uuid){
@@ -127,28 +127,28 @@ implements IBeeColonyTracker
 /* # Serialization                                                            */
 /******************************************************************************/
 
-	@Inject( method="writeNbt", at=@At("TAIL") )
-	private void WriteCustomNBT(NbtCompound nbt, RegistryWrapper.WrapperLookup registries, CallbackInfo ci){
+	@Inject( method="saveAdditional", at=@At("TAIL") )
+	private void WriteCustomNBT(CompoundTag nbt, HolderLookup.Provider registries, CallbackInfo ci){
 		if (!knownBees.isEmpty()){
-			NbtCompound list = new NbtCompound();
+			CompoundTag list = new CompoundTag();
 			for (var entry : knownBees.entrySet())
 				list.putLong(entry.getKey().toString(), entry.getValue());
 			nbt.put(KNOWNBEES_KEY, list);
 		}
 	}
 
-	@Inject( method="readNbt", at=@At("TAIL") )
-	private void ReadCustomNBT(NbtCompound nbt, RegistryWrapper.WrapperLookup registries, CallbackInfo ci){
-		if (nbt.contains(KNOWNBEES_KEY, NbtElement.COMPOUND_TYPE)){
-			NbtCompound list = nbt.getCompound(KNOWNBEES_KEY);
-			for (String key : list.getKeys()){
+	@Inject( method="loadAdditional", at=@At("TAIL") )
+	private void ReadCustomNBT(CompoundTag nbt, HolderLookup.Provider registries, CallbackInfo ci){
+		if (nbt.contains(KNOWNBEES_KEY, Tag.TAG_COMPOUND)){
+			CompoundTag list = nbt.getCompound(KNOWNBEES_KEY);
+			for (String key : list.getAllKeys()){
 				UUID uuid;
 				long time;
 				try {
 					uuid = UUID.fromString(key);
 					time = list.getLong(key);
 				} catch (IllegalArgumentException|ClassCastException e){
-					SelfCareHive.LOGGER.error("Invalid last-seen data in behive at {}:\nKey: {}, Value:\n{}", this.pos, key, nbt.get(key).asString());
+					SelfCareHive.LOGGER.error("Invalid last-seen data in behive at {}:\nKey: {}, Value:\n{}", this.worldPosition, key, nbt.get(key).getAsString());
 					continue;
 				}
 				knownBees.put(uuid, time);
@@ -162,23 +162,23 @@ implements IBeeColonyTracker
 /******************************************************************************/
 
 	@Inject(method="serverTick", at=@At("HEAD"))
-	static private void tick(World world, BlockPos pos, BlockState state, BeehiveBlockEntity blockEntity, CallbackInfo info){
+	static private void tick(Level world, BlockPos pos, BlockState state, BeehiveBlockEntity blockEntity, CallbackInfo info){
 		++((BeehiveEntityMixin)(Object)blockEntity).elapsedTicks;
 	}
 
 	@Inject(
 		require = 1,
 		method = {
-			"tryEnterHive(Lnet/minecraft/entity/Entity;)V", // 1.20.5
-			"method_21848(Lnet/minecraft/entity/passive/BeeEntity;)V" // 1.21.4
+			"Lnet/minecraft/world/level/block/entity/BeehiveBlockEntity;addOccupant(Lnet/minecraft/world/entity/Entity;)V", // 1.20.5
+//			"method_21848(Lnet/minecraft/entity/passive/BeeEntity;)V" // 1.21.4
 		},
 		at = @At("TAIL")
 	)
 	private void OnBeeEntrance(@Coerce Entity bee, CallbackInfo ci){
-		UUID uuid = bee.getUuid();
-		if (FabricLoader.getInstance().isDevelopmentEnvironment() && !this.knownBees.containsKey(uuid))
+		UUID uuid = bee.getUUID();
+		if (Config.debugMode && !this.knownBees.containsKey(uuid))
 			SelfCareHive.LOGGER.warn("An unknown bee joined the hive: {}", uuid);
-		// Bees loose their UUID when returning to the nest.
+		// Bees lose their UUID when returning to the nest.
 		this.knownBees.remove(uuid);
 	}
 
@@ -194,21 +194,21 @@ implements IBeeColonyTracker
 	 * properly set, so babies  need to have  their position  updated at a later
 	 * time.
 	 */
-	@ModifyExpressionValue( method="releaseBee", expect=1, at=@At(value="INVOKE", target="net/minecraft/block/entity/BeehiveBlockEntity$BeeData.loadEntity (Lnet/minecraft/world/World;Lnet/minecraft/util/math/BlockPos;)Lnet/minecraft/entity/Entity;") )
-	static private Entity OnBeeEntityCreated(Entity original, World world, BlockPos pos, @Local(argsOnly=true) LocalRef<BlockState> stateRef, @Share("baby") LocalRef<BeeEntity> babyRef)
+	@ModifyExpressionValue( method="releaseOccupant", expect=1, at=@At(value="INVOKE", target="Lnet/minecraft/world/level/block/entity/BeehiveBlockEntity$Occupant;createEntity(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/entity/Entity;") )
+	static private Entity OnBeeEntityCreated(Entity original, Level world, BlockPos pos, @Local(argsOnly=true) LocalRef<BlockState> stateRef, @Share("baby") LocalRef<Bee> babyRef)
 	{
-		if (original instanceof BeeEntity bee && !world.isClient() && world.getBlockEntity(pos) instanceof BeehiveBlockEntity hive){
+		if (original instanceof Bee bee && !world.isClientSide && world.getBlockEntity(pos) instanceof BeehiveBlockEntity hive){
 			IBeeColonyTracker colony = IBeeColonyTracker.Of(hive);
 			BlockState hiveState = stateRef.get();
-			BeeEntity baby = null;
+			Bee baby = null;
 
-			var result = BeehiveUtil.TryCreateBaby(bee, colony, (ServerWorld)world, hiveState, pos);
+			var result = BeehiveUtil.TryCreateBaby(bee, colony, (ServerLevel) world, hiveState, pos);
 			baby = result.getLeft();
 			hiveState = result.getRight();
 
 			hiveState = BeehiveUtil.TryHeal(bee, world, hiveState, pos);
 
-			colony.selfcarehive$RememberBee(bee.getUuid());
+			colony.selfcarehive$RememberBee(bee.getUUID());
 
 			babyRef.set(baby);
 			stateRef.set(hiveState);
@@ -217,12 +217,12 @@ implements IBeeColonyTracker
 		return original;
 	}
 
-	@WrapOperation( method="releaseBee", at=@At(value="INVOKE", target="net/minecraft/entity/Entity.refreshPositionAndAngles (DDDFF)V") )
-	static private void	OnBeePositionUpdated(Entity bee, double x, double y, double z, float yaw, float pitch, Operation<Void> original, @Share("baby") LocalRef<BeeEntity> baby){
-		BeeEntity babyEntity = baby.get();
+	@WrapOperation( method="releaseOccupant", at=@At(value="INVOKE", target="Lnet/minecraft/world/entity/Entity;moveTo(DDDFF)V") )
+	static private void	OnBeePositionUpdated(Entity bee, double x, double y, double z, float yaw, float pitch, Operation<Void> original, @Share("baby") LocalRef<Bee> baby){
+		Bee babyEntity = baby.get();
 		if (babyEntity != null){
-			babyEntity.refreshPositionAndAngles(x, y, z, yaw, pitch);
-			babyEntity.getWorld().spawnEntity(babyEntity);
+			babyEntity.moveTo(x, y, z, yaw, pitch);
+			babyEntity.level().addFreshEntity(babyEntity);
 		}
 
 		original.call(bee, x, y, z, yaw, pitch);
@@ -234,15 +234,14 @@ implements IBeeColonyTracker
 	@ModifyArg(
 		require = 1,
 		method = {
-			"tryEnterHive(Lnet/minecraft/entity/Entity;)V", // 1.20.5
-			"method_21848(Lnet/minecraft/entity/passive/BeeEntity;)V" // 1.21.4
+			"Lnet/minecraft/world/level/block/entity/BeehiveBlockEntity;addOccupant(Lnet/minecraft/world/entity/Entity;)V", // 1.20.5
 		},
-		at=@At( value="INVOKE", target="net/minecraft/block/entity/BeehiveBlockEntity.addBee (Lnet/minecraft/block/entity/BeehiveBlockEntity$BeeData;)V" )
+		at=@At( value="INVOKE", target="Lnet/minecraft/world/level/block/entity/BeehiveBlockEntity;storeBee(Lnet/minecraft/world/level/block/entity/BeehiveBlockEntity$Occupant;)V" )
 	)
-	private BeeData ReduceExitDelay(BeeData original){
-		if (!FabricLoader.getInstance().isDevelopmentEnvironment())
+	private BeehiveBlockEntity.Occupant ReduceExitDelay(BeehiveBlockEntity.Occupant original){
+		if (!Config.debugMode)
 			return original;
 
-		return new BeeData(original.entityData(), 0, 20);
+		return new BeehiveBlockEntity.Occupant(original.entityData(), 0, 20);
 	}
 }

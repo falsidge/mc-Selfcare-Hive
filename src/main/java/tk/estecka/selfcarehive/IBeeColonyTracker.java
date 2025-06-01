@@ -2,7 +2,7 @@ package tk.estecka.selfcarehive;
 
 import java.util.UUID;
 
-import net.minecraft.block.entity.BeehiveBlockEntity;
+import net.minecraft.world.level.block.entity.BeehiveBlockEntity;
 
 public interface IBeeColonyTracker
 {
